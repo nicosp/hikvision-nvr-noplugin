@@ -1,0 +1,38 @@
+# go2rtc: serves the NVR's camera streams to the browser (MSE over a
+# WebSocket, through the nginx site). A Podman Quadlet, a system service that
+# starts at boot. install.sh installs it as
+# /etc/containers/systemd/go2rtc.container, putting the go2rtc user's uid and
+# gid in place of @UID@ and @GID@.
+#
+# Root's Podman starts the container, but go2rtc runs as the go2rtc user
+# (User=, no user namespace: the same uid on the host), with no
+# capabilities and a read-only root. Its config, /etc/go2rtc, is readable
+# by that user only. It listens on 127.0.0.1 only (see go2rtc.yaml): its API
+# has no authentication.
+
+[Unit]
+Description=go2rtc NVR camera streams (as go2rtc)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=go2rtc
+Image=docker.io/alexxit/go2rtc:latest
+User=@UID@
+Group=@GID@
+# go2rtc.yaml references the NVR login as ${NVR_USER_URL}/${NVR_PASS_URL}.
+EnvironmentFile=/etc/go2rtc/go2rtc.env
+Volume=/etc/go2rtc:/config:ro
+Network=host
+DropCapability=ALL
+NoNewPrivileges=true
+ReadOnly=true
+# podman auto-update pulls a newer image and restarts it.
+AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+# Stand-in for Hikvision's Local Service, for the NVR web UI behind nginx
+# (localservice.py). Installed by deploy/install-nginx.sh.
+[Unit]
+Description=NVR web UI: Hikvision Local Service emulator
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/lib/nvr-live/localservice.py --listen 127.0.0.1:1985
+Restart=on-failure
+DynamicUser=yes
+StateDirectory=nvr-localservice
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
