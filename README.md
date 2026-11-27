@@ -202,3 +202,8 @@ sudo groupdel go2rtc   # if userdel didn't already remove it
 
 To generate the go2rtc config without installing anything:
 `./setup.py --out build`.
+
+## License
+
+MIT, see [LICENSE](LICENSE). go2rtc is a separate project with its own license;
+this repository only runs its container image.
