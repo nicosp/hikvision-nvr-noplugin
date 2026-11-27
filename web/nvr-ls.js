@@ -6,7 +6,8 @@
 // same page (/nvr-ls/bridge) and gets the window layout and what each window
 // plays. A window only has a player while it plays and is visible, and players
 // stop while the browser tab is hidden, so go2rtc only pulls the cameras that
-// are actually on screen.
+// are actually on screen. Recordings play through go2rtc's pbN streams; a paused
+// one keeps its last frame on screen while its stream is stopped.
 (() => {
   if (/\/login\.asp$/i.test(location.pathname)) return;
 
@@ -32,10 +33,11 @@
   outline: 1px solid #333; outline-offset: -1px; cursor: default; overflow: hidden; }
 .nvrls-wnd.nvrls-sel { outline: 2px solid #f0a020; outline-offset: -2px; z-index: 1; }
 .nvrls-wnd.nvrls-hidden { display: none; }
+.nvrls-wnd canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
 .nvrls-wnd video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
   pointer-events: none; transform-origin: center; transition: transform .15s; }
 .nvrls-wnd.nvrls-zoom video { transform: scale(2); }
-.nvrls-label { position: absolute; left: 6px; top: 4px; padding: 1px 5px; border-radius: 3px;
+.nvrls-label { position: absolute; left: 6px; bottom: 4px; padding: 1px 5px; border-radius: 3px;
   background: rgba(0,0,0,.55); pointer-events: none; }
 .nvrls-msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   text-align: center; padding: 8px; color: #888; pointer-events: none; }
@@ -71,6 +73,7 @@
   }
 
   function streamName(w) {
+    if (w.pb) return `pb${w.pb}`;
     const ch = channelOf(w);
     const c = catalog.get(ch);
     if (w.kind === "main") {
@@ -157,14 +160,21 @@
       const i = Number(cell.dataset.wnd);
       cell.classList.toggle("nvrls-hidden", !shown.has(i));
       const w = state.wnds[i];
-      const want = shown.has(i) && w && !document.hidden ? (w.zero ? "zero" : streamName(w)) : null;
+      const want = shown.has(i) && w && !document.hidden
+        ? (w.zero ? "zero" : w.paused ? `paused:${w.at}` : streamName(w)) : null;
       const cur = players.get(i);
       if (cur && cur.name === want) continue;
+      const still = want?.startsWith("paused:") ? (cur?.still || frameOf(i)) : null;
       if (cur) stopPlayer(i);
       cell.replaceChildren();
       if (!w) continue;
-      const label = w.zero ? "Zero channel" : `${catalog.get(channelOf(w))?.name || `Channel ${channelOf(w)}`} \u00B7 ${w.kind}`;
-      if (want === "zero") {
+      const label = w.zero ? "Zero channel"
+        : `${catalog.get(channelOf(w))?.name || `Channel ${channelOf(w)}`} \u00B7 ${w.pb || w.paused ? "playback" : w.kind}`;
+      if (still || want?.startsWith("paused:")) {
+        if (still) cell.append(still);
+        cell.append(el("span", "nvrls-label", `${label} \u00B7 paused`));
+        players.set(i, { name: want, el: null, still });
+      } else if (want === "zero") {
         cell.append(el("div", "nvrls-msg", "The zero channel isn't available here."));
       } else if (want) {
         const v = new Video();
@@ -183,8 +193,19 @@
     const p = players.get(i);
     if (!p) return;
     stopRecording(i);
-    p.el.remove(); // disconnects the WebSocket; go2rtc stops pulling when nobody watches
+    p.el?.remove(); // disconnects the WebSocket; go2rtc stops pulling when nobody watches
     players.delete(i);
+  }
+
+  // The window's current picture, as a canvas (kept on screen while paused).
+  function frameOf(i) {
+    const v = videoOf(i);
+    if (!v || !v.videoWidth) return null;
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth;
+    c.height = v.videoHeight;
+    c.getContext("2d").drawImage(v, 0, 0);
+    return c;
   }
 
   function stopAllPlayers() {
@@ -192,12 +213,12 @@
   }
 
   function videoOf(i) {
-    return players.get(i)?.el.video || null;
+    return players.get(i)?.el?.video || null;
   }
 
   function applySound() {
     for (const [i, p] of players) {
-      if (!p.el.video) continue;
+      if (!p.el?.video) continue;
       p.el.video.muted = i !== state.sound;
       p.el.video.volume = Math.max(0, Math.min(1, state.volume / 100));
     }
@@ -222,12 +243,8 @@
   }
 
   function capture(i, fileName) {
-    const v = videoOf(i);
-    if (!v || !v.videoWidth) return;
-    const c = document.createElement("canvas");
-    c.width = v.videoWidth;
-    c.height = v.videoHeight;
-    c.getContext("2d").drawImage(v, 0, 0);
+    const c = frameOf(i) || players.get(i)?.still;
+    if (!c) return;
     c.toBlob((b) => b && download(b, baseName(fileName, "jpg")), "image/jpeg", 0.92);
   }
 
@@ -276,7 +293,12 @@
   function connect() {
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     ws = new WebSocket(`${proto}${location.host}/nvr-ls/bridge?page=${PAGE}`);
-    ws.onopen = () => { retry = 1000; };
+    ws.onopen = () => {
+      retry = 1000;
+      // For recordings: the UI shows times in the browser's time zone, and may
+      // number channels from the NVR's ipChanBase.
+      ws.send(JSON.stringify({ type: "hello", ipChanBase, tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "" }));
+    };
     ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch { /* ignore */ } };
     ws.onclose = () => {
       ws = null;

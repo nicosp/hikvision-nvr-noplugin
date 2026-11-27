@@ -7,7 +7,7 @@ writes into OUT_DIR (default ./build):
   go2rtc.env   - URL-encoded credentials for the container (mode 600)
   streams.json - channel and stream names for the web player (no secrets)
 With NVR_ENCRYPTED=1 (the default) the streams go through hikdecrypt.py,
-which undoes Hikvision's stream encryption.
+which undoes Hikvision's stream encryption. Recordings always do (pb1..pb16).
 
 Usually run for you by deploy/install.sh, which installs them in /etc/go2rtc.
 
@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+PB_SLOTS = 16  # must match PB_SLOTS in localservice.py
 
 
 def load_env(path):
@@ -120,6 +121,11 @@ def main():
             lines.append(f"  ch{cid}_{suffix}: {src}")
         if transcode:
             lines.append(f"  ch{cid}_main_h264: ffmpeg:ch{cid}_main#video=h264")
+    # Recordings: playback slots, assigned by localservice.py, which tells
+    # hikdecrypt.py what to play. Nothing runs until someone plays one.
+    lines.append("  # Playback (Playback page, via localservice.py)")
+    for i in range(1, PB_SLOTS + 1):
+        lines.append(f"  pb{i}: exec:python3 -I /config/hikdecrypt.py --slot {i} {{output}}")
     out = args.out
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     q = lambda s: urllib.parse.quote(s, safe="")  # noqa: E731

@@ -10,6 +10,11 @@ an RTSP server: go2rtc runs it as
 Without an output URL it writes the decrypted video as a raw Annex-B bitstream
 to stdout instead, for testing:  hikdecrypt.py 102 --seconds 5 | ffplay -
 
+Recordings: --start/--end play /Streaming/tracks/<channel> from the NVR. With
+--slot N (go2rtc's playback streams pb1, pb2, ...) it asks localservice.py
+what to play, and reports the recording time back to it: Hikvision puts the
+absolute time in a private RTP header extension on key frames.
+
 The scheme, worked out from a DS-7604NI-K1(B)'s streams:
   - only NAL units whose RTP packets carry a header extension are encrypted
     (parameter sets, key frames and about every fourth P frame);
@@ -31,10 +36,13 @@ import re
 import socket
 import sys
 import time
+import json
 import urllib.parse
+import urllib.request
 
 KEEPALIVE = 25          # seconds between keepalives to the NVR
 ENCRYPTED_BYTES = 4096  # at most this much of a NAL unit is encrypted
+AUDIO_CODECS = {"PCMA", "PCMU", "MPEG4-GENERIC", "OPUS", "L16"}  # audio go2rtc can serve
 
 
 class AES128ECB:
@@ -168,6 +176,31 @@ def video_codec(lines):
     return ""
 
 
+def recording_time(b):
+    """Recording time in a Hikvision RTP header extension ("HK" record, type 0x40),
+    as YYYYMMDDTHHMMSS, or None. Bits: year-2000 (8), month (4), day (5),
+    hour (5), minute (6), second (6), then sub-second bits."""
+    if not b[0] & 0x10:
+        return None
+    off = 12 + 4 * (b[0] & 0x0F)
+    ext = b[off + 4:off + 4 + 4 * int.from_bytes(b[off + 2:off + 4], "big")]
+    i = 0
+    while i + 2 <= len(ext):
+        typ, ln = ext[i], ext[i + 1]
+        val = ext[i + 2:i + 2 + ln]
+        if typ == 0x40 and len(val) >= 10 and val[:2] == b"HK":
+            v = int.from_bytes(val[4:10], "big")
+            y, mo, d = 2000 + (v >> 40), (v >> 36) & 0xF, (v >> 31) & 0x1F
+            h, mi, se = (v >> 26) & 0x1F, (v >> 20) & 0x3F, (v >> 14) & 0x3F
+            if 1 <= mo <= 12 and 1 <= d <= 31 and h < 24 and mi < 60 and se < 60:
+                return f"{y:04d}{mo:02d}{d:02d}T{h:02d}{mi:02d}{se:02d}"
+            return None
+        if ln == 0 and typ == 0:
+            break
+        i += 2 + ln
+    return None
+
+
 def rtp_payload(b):
     """(start, end) of the RTP payload in packet b."""
     off = 12 + 4 * (b[0] & 0x0F)
@@ -289,10 +322,36 @@ def annexb(packets, hevc, state):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("channel", help="e.g. 101 (channel 1 main) or 102 (sub)")
+    ap.add_argument("channel", nargs="?", help="e.g. 101 (channel 1 main) or 102 (sub)")
     ap.add_argument("output", nargs="?", help="RTSP URL to publish to (go2rtc's {output})")
+    ap.add_argument("--start", help="play a recording from this time (YYYYMMDDTHHMMSSZ, NVR clock)")
+    ap.add_argument("--end", help="... up to this time (default: open-ended)")
+    ap.add_argument("--slot", type=int, help="playback slot: ask localservice.py what to play")
+    ap.add_argument("--service", default="127.0.0.1:1985", help="localservice.py address (--slot)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (testing)")
     args = ap.parse_args()
+
+    report = None
+    if args.slot is not None:  # what this playback stream plays: {"track", "start", "end", "gen"}
+        if args.output is None:  # "--slot N {output}": the only positional is the output
+            args.output, args.channel = args.channel, None
+        try:
+            with urllib.request.urlopen(f"http://{args.service}/slot/{args.slot}", timeout=5) as r:
+                job = json.load(r)
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"slot {args.slot}: nothing to play ({e})")
+        args.channel, args.start, args.end = str(int(job["track"])), job["start"], job.get("end")
+        rhost, rport = args.service.rsplit(":", 1)
+        rsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tag = f"nvrls-time {args.slot} {int(job['gen'])} "
+
+        def report(t):
+            try:
+                rsock.sendto((tag + t).encode(), (rhost, int(rport)))
+            except OSError:
+                pass
+    if not args.channel:
+        ap.error("channel or --slot is required")
 
     uq = urllib.parse.unquote
     host = os.environ["NVR_HOST"]
@@ -301,16 +360,28 @@ def main():
     aes = AES128ECB(key[:16].ljust(16, b"\0"))
 
     # Source: the NVR.
-    src_url = f"rtsp://{host}:554/Streaming/Channels/{int(args.channel)}"
+    if args.start:  # a recording: /Streaming/tracks/<channel>?starttime=...
+        times = [t for t in (args.start, args.end) if t]
+        if not all(re.fullmatch(r"\d{8}T\d{6}Z", t) for t in times):
+            sys.exit("--start/--end must look like 20260101T120000Z")
+        src_url = f"rtsp://{host}:554/Streaming/tracks/{int(args.channel)}?starttime={args.start}"
+        if args.end:
+            src_url += f"&endtime={args.end}"
+    else:
+        src_url = f"rtsp://{host}:554/Streaming/Channels/{int(args.channel)}"
     nvr = RTSPConn(host, 554, user, password)
     head, sdp = nvr.request("DESCRIBE", src_url, "Accept: application/sdp\r\n")
     m = re.search(r"^Content-Base:\s*(\S+)", head, re.I | re.M)
-    base = (m.group(1) if m else src_url).rstrip("/")
+    base = (m.group(1) if m else src_url.split("?")[0]).rstrip("/")
     media = parse_sdp(sdp)
     if not args.output:  # stdout mode: video only
         media = [x for x in media if x[0] == "video"]
+    # Recordings may carry audio go2rtc can't use (e.g. G.722.1): leave it out.
+    media = [x for x in media if x[0] == "video" or video_codec(x[1]) in AUDIO_CODECS]
     video_ch, hevc = None, True
+    payload_types = {}  # interleaved channel -> RTP payload types its media declares
     for i, (kind, lines, ctrl) in enumerate(media):
+        payload_types[2 * i] = {int(pt) for pt in lines[0].split()[3:] if pt.isdigit()}
         track = ctrl if ctrl.startswith("rtsp://") else f"{base}/{ctrl}"
         nvr.request("SETUP", track,
                     f"Transport: RTP/AVP/TCP;unicast;interleaved={2 * i}-{2 * i + 1}\r\n")
@@ -342,6 +413,7 @@ def main():
     out = sys.stdout.buffer
     started = False
     fu_state = {}
+    last_time = None
 
     try:
         for ch, pkt in nvr.frames():
@@ -350,6 +422,11 @@ def main():
                 last_keepalive = time.monotonic()
             if ch % 2:  # RTCP: not forwarded
                 continue
+            if report and ch == video_ch and (t := recording_time(pkt)) and t != last_time:
+                last_time = t
+                report(t)
+            if len(pkt) < 12 or pkt[1] & 0x7F not in payload_types.get(ch, ()):
+                continue  # e.g. the NVR's empty PT 112 packets that only carry the time
             pkts = dec.process(pkt) if ch == video_ch else [pkt]
             if sink:
                 for p in pkts:

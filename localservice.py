@@ -16,6 +16,12 @@ Only what a window shows is streamed: a window that isn't playing or isn't
 visible in the current split has no player, and go2rtc only pulls a camera
 while someone watches it.
 
+Recordings play through go2rtc's playback streams pb1..pbN: a playback window
+gets a free slot, and the hikdecrypt.py that go2rtc starts for that stream asks
+this service what to play (GET /slot/N, localhost only) and reports the
+recording time back (UDP, same port), which answers the UI's getOSDTime. Pause
+and resume restart the stream from where it was.
+
 Commands that need the viewer's local disk (upgrade, upload, file download,
 browse) or two-way audio fail with an error, as they would if the helper
 couldn't do them. Drawing settings (motion grid, regions, lines) are echoed
@@ -35,8 +41,11 @@ import re
 import struct
 import time
 import uuid
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from zoneinfo import ZoneInfo
 
 VERSION = "1.9.9.999"  # newer than any version the UI asks to upgrade from
 MAX_MESSAGE = 1 << 20
@@ -44,6 +53,9 @@ MAX_PAGES = 200
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PAGE_ID = re.compile(r"^[A-Za-z0-9]{1,32}$")
 FAIL = 1  # generic error code for commands that can't be done here
+PB_SLOTS = 16  # go2rtc playback streams pb1..pb16 (setup.py), shared by all viewers
+PB_LAG = 1.0   # seconds the viewer is behind the time hikdecrypt.py reports
+TZ_NAME = re.compile(r"^[A-Za-z0-9_+\-/]{1,64}$")
 
 log = logging.getLogger("localservice")
 
@@ -75,6 +87,7 @@ UNSUPPORTED = {
     "video.uploadFile", "video.downloadFile", "video.startAsyncDownload",
     "video.startUpgrade", "video.exportDeviceLog", "video.exportReport",
     "video.startTalk", "video.reversePlay",
+    "video.fast", "video.slow", "video.frame",  # playback runs at normal speed only
 }
 
 
@@ -151,13 +164,15 @@ class Page:
     def __init__(self, pid):
         self.pid = pid
         self.plugins, self.bridges = set(), set()
+        self.tz = None          # the browser's time zone (IANA name), from the page script
+        self.ipchanbase = 0     # first channel number of the NVR's SDK numbering
         self.reset()
 
     def reset(self):
         self.created = False
         self.split = 1
         self.selected = 0
-        self.wnds = {}          # wndIndex -> {"ch", "kind"} or {"zero": True}
+        self.wnds = {}          # wndIndex -> {"ch", "kind"[, "pb" or "paused"]} or {"zero": True}
         self.sound = -1         # window with sound on
         self.volume = 50
         self.echo = {}
@@ -178,6 +193,30 @@ class Page:
     async def to_plugins(self, msg):
         for p in list(self.plugins):
             await p.send(msg)
+
+
+def parse_time(value):
+    """The UI's recording times (20260101T120000Z or 2026-01-01T12:00:00Z, NVR
+    clock): normalised to 20260101T120000Z, or None."""
+    t = str(value or "").replace("-", "").replace(":", "")
+    return t if re.fullmatch(r"\d{8}T\d{6}Z", t) else None
+
+
+def parse_recording_url(url):
+    """(channel, stream type) of a recording URL. The UI sends
+    /SDK/playback/<id - 1> ("TCP" transport, like live view),
+    /ISAPI/streaming/tracks/<id> or .../<id>[/transcoding], id = channel * 100 + type."""
+    path = urlsplit(url).path
+    m = re.search(r"/SDK/playback/(\d+)", path)
+    if m:
+        sid = int(m.group(1)) + 1
+    else:
+        ids = re.findall(r"/(\d{3,5})(?=/|$)", path)
+        if not ids:
+            return None
+        sid = int(ids[-1])
+    ch, t = divmod(sid, 100)
+    return (ch, t) if ch >= 1 and 1 <= t <= 9 else None
 
 
 def parse_play_url(url):
@@ -205,6 +244,9 @@ def parse_play_url(url):
 class Service:
     def __init__(self, state_dir):
         self.pages = {}
+        self.slots = {}         # playback slot -> {"track", "start", "end", "gen", "time", "mono", "page", "wnd"}
+        self.free = deque(range(1, PB_SLOTS + 1))
+        self.gen = 0
         self.cfg_file = Path(state_dir) / "localconfig.json" if state_dir else None
         self.config = dict(DEFAULT_CONFIG)
         if self.cfg_file and self.cfg_file.exists():
@@ -231,6 +273,69 @@ class Service:
                 return None
             p = self.pages[pid] = Page(pid)
         return p
+
+    # --- playback slots -------------------------------------------------------------
+
+    def take_slot(self, page, wnd, track, start, end):
+        if not self.free:
+            log.warning("page %s: all %d playback streams are in use", page.pid, PB_SLOTS)
+            raise Failed(FAIL)
+        n = self.free.popleft()
+        self.gen += 1
+        self.slots[n] = {"track": track, "start": start, "end": end, "gen": self.gen,
+                         "time": None, "mono": None, "page": page, "wnd": wnd}
+        return n
+
+    def drop_slot(self, n):
+        if self.slots.pop(n, None) is not None:
+            self.free.append(n)  # reused last, so go2rtc has stopped the old one by then
+
+    def clear_wnd(self, page, wnd):
+        w = page.wnds.pop(wnd, None)
+        if w and "pb" in w:
+            self.drop_slot(w["pb"])
+
+    def clear_all(self, page):
+        for wnd in list(page.wnds):
+            self.clear_wnd(page, wnd)
+
+    @staticmethod
+    def wall_time(slot):
+        """What the viewer sees now (NVR clock, naive datetime)."""
+        if slot["time"]:
+            seen = datetime.strptime(slot["time"], "%Y%m%dT%H%M%S")
+            return seen + timedelta(seconds=time.monotonic() - slot["mono"] - PB_LAG)
+        return datetime.strptime(slot["start"], "%Y%m%dT%H%M%SZ")
+
+    @staticmethod
+    def epoch(page, wall):
+        """The UI shows osdTime as a date in the browser's time zone."""
+        if page.tz:
+            try:
+                return int(wall.replace(tzinfo=ZoneInfo(page.tz)).timestamp())
+            except (KeyError, ValueError, OSError):
+                pass
+        return int(time.mktime(wall.timetuple()))
+
+    def slot_job(self, n):
+        slot = self.slots.get(n)
+        if slot is None:
+            return None
+        # If go2rtc restarts the stream (viewer reconnected), go on from where it was.
+        start = f"{slot['time']}Z" if slot["time"] else slot["start"]
+        if slot["end"] and start >= slot["end"]:
+            return None
+        return {"track": slot["track"], "start": start, "end": slot["end"], "gen": slot["gen"]}
+
+    def time_report(self, data):
+        """UDP from hikdecrypt.py: "nvrls-time <slot> <gen> <YYYYMMDDTHHMMSS>"."""
+        try:
+            tag, n, gen, t = data.decode("ascii").split()
+            slot = self.slots.get(int(n))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if tag == "nvrls-time" and slot and slot["gen"] == int(gen) and re.fullmatch(r"\d{8}T\d{6}", t):
+            slot["time"], slot["mono"] = t, time.monotonic()
 
     def release(self, page):
         if not page.plugins and not page.bridges:
@@ -269,6 +374,7 @@ class Service:
         finally:
             page.plugins.discard(ws)
             if not page.plugins:  # page closed or navigated: nothing plays any more
+                self.clear_all(page)
                 page.reset()
                 await page.push()
             log.info("page %s: plugin disconnected", page.pid)
@@ -281,7 +387,7 @@ class Service:
             await page.push()
         elif cmd == "window.destroyWnd":
             page.created = False
-            page.wnds.clear()
+            self.clear_all(page)
             await page.push()
         elif cmd == "window.getLocalServiceVersion":
             return {"localServiceVersion": VERSION}
@@ -290,22 +396,25 @@ class Service:
             page.selected = 0
             await page.push()
             page.events.append({"cmd": "window.onGetSelectWndInfo", "wndInfo": {"wndIndex": 0}})
+        elif cmd == "video.startPlay" and parse_time(m.get("startTime")):
+            await self.start_playback(page, wnd, m)
         elif cmd == "video.startPlay":
             target = parse_play_url(str(m.get("url", "")))
             if target is None or target.get("playback"):
-                raise Failed(FAIL)  # recordings: not supported yet
+                raise Failed(FAIL)
+            self.clear_wnd(page, wnd)
             page.wnds[wnd] = target
             log.info("page %s: window %d plays %s", page.pid, wnd,
                      "zero channel" if target.get("zero") else
                      f"channel {target['ch']}{' (SDK numbering)' if target.get('sdk') else ''} {target['kind']}")
             await page.push()
         elif cmd == "video.stop":
-            page.wnds.pop(wnd, None)
+            self.clear_wnd(page, wnd)
             if page.sound == wnd:
                 page.sound = -1
             await page.push()
         elif cmd == "video.stopAll":
-            page.wnds.clear()
+            self.clear_all(page)
             page.sound = -1
             await page.push()
         elif cmd == "video.openSound":
@@ -340,7 +449,31 @@ class Service:
         elif cmd == "video.getDecryptString":
             return {"decryptString": m.get("encrypted", "")}
         elif cmd == "video.getOSDTime":
+            w = page.wnds.get(wnd) or {}
+            if "pb" in w:
+                return {"osdTime": self.epoch(page, self.wall_time(self.slots[w["pb"]]))}
+            if w.get("paused"):
+                return {"osdTime": self.epoch(page, datetime.strptime(w["at"], "%Y%m%dT%H%M%SZ"))}
             return {"osdTime": int(time.time())}
+        elif cmd == "video.pause":
+            w = page.wnds.get(wnd) or {}
+            if "pb" not in w:
+                raise Failed(FAIL)
+            slot = self.slots[w["pb"]]
+            at = self.wall_time(slot).strftime("%Y%m%dT%H%M%SZ")
+            self.drop_slot(w.pop("pb"))
+            w.update(paused=True, at=at, track=slot["track"], end=slot["end"])
+            log.info("page %s: window %d paused at %s", page.pid, wnd, at)
+            await page.push()
+        elif cmd == "video.resume":
+            w = page.wnds.get(wnd) or {}
+            if not w.get("paused"):
+                raise Failed(FAIL)
+            w["pb"] = self.take_slot(page, wnd, w["track"], w["at"], w["end"])
+            for k in ("paused", "at", "track", "end"):
+                w.pop(k, None)
+            log.info("page %s: window %d resumed (stream pb%d)", page.pid, wnd, w["pb"])
+            await page.push()
         elif cmd == "video.getPlayInfo":
             return {"playInfo": {"playInfo": {}}}
         elif cmd == "video.getLastError":
@@ -361,6 +494,22 @@ class Service:
         # play mode, https, reconnect info, secret keys, ...) has no effect here.
         return None
 
+    async def start_playback(self, page, wnd, m):
+        rec = parse_recording_url(str(m.get("url", "")))
+        if rec is None:
+            log.info("page %s: can't play recording URL %s", page.pid, urlsplit(str(m.get("url", ""))).path[:100])
+            raise Failed(FAIL)
+        ch, t = rec
+        if page.ipchanbase > 1 and ch >= page.ipchanbase:  # SDK numbering
+            ch = ch - page.ipchanbase + 1
+        start, end = parse_time(m.get("startTime")), parse_time(m.get("stopTime"))
+        self.clear_wnd(page, wnd)
+        n = self.take_slot(page, wnd, ch * 100 + t, start, end)
+        page.wnds[wnd] = {"ch": ch, "kind": "main" if t == 1 else "sub", "pb": n}
+        log.info("page %s: window %d plays the recording of channel %d from %s (stream pb%d)",
+                 page.pid, wnd, ch, start, n)
+        await page.push()
+
     # --- the page script ------------------------------------------------------------
 
     async def bridge(self, ws, page):
@@ -372,7 +521,13 @@ class Service:
                     msg = json.loads(text)
                 except ValueError:
                     continue
-                if isinstance(msg, dict) and msg.get("type") == "select":
+                if isinstance(msg, dict) and msg.get("type") == "hello":
+                    tz, base = msg.get("tz"), msg.get("ipChanBase")
+                    if isinstance(tz, str) and TZ_NAME.match(tz):
+                        page.tz = tz
+                    if isinstance(base, int) and 0 <= base < 10000:
+                        page.ipchanbase = base
+                elif isinstance(msg, dict) and msg.get("type") == "select":
                     wnd = int(msg.get("wnd") or 0)
                     if 0 <= wnd < 16:
                         page.selected = wnd
@@ -402,6 +557,16 @@ class Service:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
         url = urlsplit(target)
+        slot = re.fullmatch(r"/slot/(\d{1,3})", url.path)
+        if method == "GET" and slot and "upgrade" not in headers:  # hikdecrypt.py asking what to play
+            job = self.slot_job(int(slot.group(1)))
+            body = json.dumps(job).encode() if job else b""
+            status = b"200 OK" if job else b"404 Not Found"
+            writer.write(b"HTTP/1.1 " + status + b"\r\nContent-Type: application/json\r\nContent-Length: "
+                         + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+            await writer.drain()
+            writer.close()
+            return
         pid = (parse_qs(url.query).get("page") or [""])[0]
         key = headers.get("sec-websocket-key", "")
         if (method != "GET" or url.path not in ("/plugin", "/bridge") or not PAGE_ID.match(pid)
@@ -458,6 +623,12 @@ async def main():
     host, port = args.listen.rsplit(":", 1)
     svc = Service(args.state)
     server = await asyncio.start_server(svc.handle, host, int(port), limit=16384)
+
+    class TimeReports(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            svc.time_report(data)
+
+    await asyncio.get_running_loop().create_datagram_endpoint(TimeReports, local_addr=(host, int(port)))
     log.info("listening on %s (version %s)", args.listen, VERSION)
     async with server:
         await server.serve_forever()
