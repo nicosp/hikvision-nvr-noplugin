@@ -36,7 +36,8 @@ browser ──https──▶ nginx ──▶ NVR web UI (unchanged, apart from a
   windows inside the page and plays the matching go2rtc stream in each.
 - **nginx** proxies the NVR and points the UI's player script at
   localservice.py instead of `127.0.0.1`. It also hides the "Download Plug-in"
-  link.
+  link (the page script hides it too, in case the browser has an old copy of
+  the page header).
 
 ## Requirements
 
@@ -149,7 +150,11 @@ site. The defaults are sub stream and "start all live view" on.
 - No video in Live View: check that the streams play at
   <http://127.0.0.1:1984> on the server. If they don't, check `NVR_HOST`, the
   login, and `NVR_KEY` if encryption is on.
-- After updating, reload the NVR page with Ctrl+Shift+R.
+- After updating, reload the NVR page with Ctrl+Shift+R. If the page still
+  behaves as before (for example "Download Plug-in" still shows), clear the
+  browser's cache for the site.
+- Playback at 4x stutters: the browser decodes four times the normal frame
+  rate then. Use the sub stream, or a lower speed.
 - Each stream can also be opened directly, for example in VLC:
   `rtsp://NVR:554/Streaming/Channels/101` (camera 1 main), `…102` (sub).
   With encryption on, VLC shows garbled video.
