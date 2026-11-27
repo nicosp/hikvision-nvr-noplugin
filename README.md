@@ -136,8 +136,11 @@ site. The defaults are sub stream and "start all live view" on.
 - **H.265**: most Hikvision cameras send H.265. Recent Chrome and Firefox play
   it with hardware decoding. If yours can't, set `NVR_TRANSCODE=1` or switch
   the camera to H.264.
-- Live video is about 1 second behind. That is go2rtc's MSE player keeping a
-  small buffer for smooth playback.
+- Video plays at exactly 1x with a small buffer (typically 0.1–0.3 s behind).
+  go2rtc's player would otherwise keep shifting the playback rate around 1x
+  (0.88x, 1.01x, ...) to hold about a second of buffer; the page script turns
+  that off and jumps ahead instead if more than 2 s pile up. Browser add-ons
+  that change the playback speed have no effect on these videos.
 
 ## Troubleshooting
 

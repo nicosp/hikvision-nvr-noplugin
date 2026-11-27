@@ -84,10 +84,34 @@
     return `ch${ch}_sub`;
   }
 
+  // go2rtc's player sets playbackRate to the seconds buffered on every chunk,
+  // so playback keeps drifting between ~0.85x and 1x (visible in Firefox).
+  // Play at exactly 1x instead, and jump ahead if more than MAX_DELAY seconds
+  // pile up (after a stall the buffer refills by itself).
+  const MAX_DELAY = 2;
+  const rateProp = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "playbackRate");
+  function steadyRate(video) {
+    Object.defineProperty(video, "playbackRate", {
+      configurable: true,
+      get() { return rateProp.get.call(this); },
+      set() { /* ignore the player's live-edge chasing */ },
+    });
+    video.addEventListener("timeupdate", () => {
+      if (video.paused || !video.buffered.length) return;
+      const end = video.buffered.end(video.buffered.length - 1);
+      if (end - video.currentTime > MAX_DELAY) video.currentTime = end - 0.3;
+    });
+  }
+
   async function videoClass() {
     if (!VideoEl) {
       const { VideoRTC } = await import("/go2rtc/video-rtc.js");
-      VideoEl = class extends VideoRTC {};
+      VideoEl = class extends VideoRTC {
+        oninit() {
+          super.oninit();
+          steadyRate(this.video);
+        }
+      };
       if (!customElements.get("nvrls-video")) customElements.define("nvrls-video", VideoEl);
     }
     return VideoEl;
