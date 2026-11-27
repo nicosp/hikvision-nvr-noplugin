@@ -14,11 +14,11 @@ Recordings: --start/--end play /Streaming/tracks/<channel> from the NVR. With
 --slot N (go2rtc's playback streams pb1, pb2, ...) it asks localservice.py
 what to play, and reports the recording time back to it: Hikvision puts the
 absolute time in a private RTP header extension on key frames. localservice.py
-also sets the speed (RTSP Scale). The browser gets the normal frame rate at
-any speed: when slower, timestamps are stretched; when faster, only the first
-1/speed of each keyframe group is passed on (the rest only serves frames
-that are dropped too). Single-frame stepping (the NVR is paused and frames are
-released one at a time).
+also sets the speed (RTSP Scale). The NVR sends every frame at that speed and
+the timestamps are scaled to match, so the browser plays it faster or slower
+(at 4x it decodes 4 times the frame rate: every P frame needs the one before).
+Single-frame stepping: the NVR is paused and frames are released one at a
+time.
 
 The scheme, worked out from a DS-7604NI-K1(B)'s streams:
   - only NAL units whose RTP packets carry a header extension are encrypted
@@ -279,63 +279,6 @@ def recording_time(b):
     return None
 
 
-def nal_info(pkt, hevc):
-    """(NAL type, starts a NAL unit) of an RTP video packet, or (None, False)."""
-    s, e = rtp_payload(pkt)
-    p = pkt[s:e]
-    if len(p) < 3:
-        return None, False
-    if hevc:
-        t = (p[0] >> 1) & 0x3F
-        if t == 49:  # fragment
-            return p[2] & 0x3F, bool(p[2] & 0x80)
-        if t == 48 and len(p) >= 5:  # aggregation: the first NAL unit inside
-            return (p[4] >> 1) & 0x3F, True
-        return t, True
-    t = p[0] & 0x1F
-    if t == 28:
-        return p[1] & 0x1F, bool(p[1] & 0x80)
-    if t == 24 and len(p) >= 4:
-        return p[3] & 0x1F, True
-    return t, True
-
-
-class FrameThinner:
-    """Faster than normal: keep the first 1/speed of each keyframe group and
-    drop the rest, so the browser decodes the normal frame rate. Later frames
-    of a group only serve as references for later ones, so this always decodes."""
-
-    def __init__(self, hevc):
-        self.hevc = hevc
-        self.gop = 50        # frames per keyframe group, learnt from the stream
-        self.count = 0       # frames since the last keyframe
-        self.keep = None     # decision for the current frame (access unit)
-        self.has_slice = False
-        self.dropping = False  # a frame of this group was dropped: drop up to the next keyframe
-
-    def __call__(self, pkt, speed):
-        t, start = nal_info(pkt, self.hevc)
-        if t is not None:
-            slice_ = t < 32 if self.hevc else 1 <= t <= 5
-            key = 16 <= t <= 21 if self.hevc else t == 5
-            if slice_ and start and self.keep is None:
-                if key:
-                    if self.count:
-                        self.gop = max(self.count, 1)
-                    self.count = 0
-                    self.keep, self.dropping = True, False
-                else:
-                    self.keep = not self.dropping and (speed <= 1 or self.count < max(1, round(self.gop / speed)))
-                    self.dropping = not self.keep
-                self.has_slice = True
-        keep = True if self.keep is None else self.keep  # parameter sets etc.
-        if pkt[1] & 0x80:  # end of the frame
-            if self.has_slice:
-                self.count += 1
-            self.keep, self.has_slice = None, False
-        return keep
-
-
 def rtp_payload(b):
     """(start, end) of the RTP payload in packet b."""
     off = 12 + 4 * (b[0] & 0x0F)
@@ -548,7 +491,6 @@ def main():
     held = deque()         # single-frame mode: packets read but not yet released
     held_frames = 0
     stepping, done, nvr_paused = False, 0, False
-    thin = FrameThinner(hevc)
 
     def is_frame_end(ch, pkt):
         return ch == video_ch and pkt[1] & 0x80 and pkt[1] & 0x7F in payload_types[ch]
@@ -571,9 +513,7 @@ def main():
                 if d >= 1 << 31 or d > 90000 * 5:  # backwards or a jump: one frame on
                     d = 3600
                 st[0] = ts
-                if not thin(pkt, speed):
-                    return  # dropped frames take no time on the way out
-                st[1] += d / speed if speed < 1 else d
+                st[1] += d / speed
                 pkt = pkt[:4] + (int(st[1]) & 0xFFFFFFFF).to_bytes(4, "big") + pkt[8:]
         pkts = dec.process(pkt) if ch == video_ch else [pkt]
         if sink:

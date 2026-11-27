@@ -195,11 +195,10 @@ The replies to those UDP reports carry what the stream should do, and
 hikdecrypt.py applies it to the NVR session:
 
 - **Speed** (1/4x to 4x): `PLAY` with `Scale`. The NVR then sends every frame,
-  faster or slower. The browser always gets the normal frame rate: when
-  slower, hikdecrypt.py stretches the timestamps; when faster, it passes on
-  only the first 1/speed of each keyframe group (2 s of video), so fast
-  forward plays short stretches at normal pace and jumps ahead, and the
-  browser never has to decode more than at normal speed.
+  faster or slower, and hikdecrypt.py scales the timestamps to match, so the
+  video really plays faster or slower. At 4x the browser decodes four times
+  the normal frame rate (each frame depends on the one before, so none can be
+  skipped); hardware decoding handles that easily.
 - **Single frame**: the NVR is paused (`PAUSE`), hikdecrypt.py keeps a few
   frames in hand and releases one per step, and the page pauses the video and
   moves it on one frame. Play goes on from there.
