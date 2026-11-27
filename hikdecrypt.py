@@ -13,7 +13,10 @@ to stdout instead, for testing:  hikdecrypt.py 102 --seconds 5 | ffplay -
 Recordings: --start/--end play /Streaming/tracks/<channel> from the NVR. With
 --slot N (go2rtc's playback streams pb1, pb2, ...) it asks localservice.py
 what to play, and reports the recording time back to it: Hikvision puts the
-absolute time in a private RTP header extension on key frames.
+absolute time in a private RTP header extension on key frames. localservice.py
+also sets the speed (RTSP Scale; timestamps are rescaled so the browser plays
+at normal pace) and single-frame stepping (the NVR is paused and frames are
+released one at a time).
 
 The scheme, worked out from a DS-7604NI-K1(B)'s streams:
   - only NAL units whose RTP packets carry a header extension are encrypted
@@ -33,10 +36,12 @@ import ctypes.util
 import hashlib
 import os
 import re
+import select
 import socket
 import sys
 import time
 import json
+from collections import deque
 import urllib.parse
 import urllib.request
 
@@ -137,21 +142,92 @@ class RTSPConn:
             return head, resp_body
         raise RuntimeError("authentication failed (check NVR_USER/NVR_PASS)")
 
+    def _take(self):
+        """The next interleaved (channel, packet) in the buffer, or None if
+        it isn't complete yet. RTSP replies in between are skipped."""
+        while self.buf:
+            if self.buf[0] == 0x24:
+                if len(self.buf) < 4:
+                    return None
+                n = int.from_bytes(self.buf[2:4], "big")
+                if len(self.buf) < 4 + n:
+                    return None
+                ch, pkt, self.buf = self.buf[1], self.buf[4:4 + n], self.buf[4 + n:]
+                return ch, pkt
+            if self.buf.startswith(b"RTSP/"):
+                end = self.buf.find(b"\r\n\r\n")
+                if end < 0:
+                    return None
+                m = re.search(rb"Content-Length:\s*(\d+)", self.buf[:end], re.I)
+                total = end + 4 + (int(m.group(1)) if m else 0)
+                if len(self.buf) < total:
+                    return None
+                self.buf = self.buf[total:]
+                continue
+            if len(self.buf) < 5 and b"RTSP/".startswith(self.buf):
+                return None
+            self.buf = self.buf[1:]
+        return None
+
+    def next_frame(self, timeout=None):
+        """(channel, packet), or None if none is complete within timeout seconds."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while (item := self._take()) is None:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([self.sock], [], [], left)[0]:
+                    return None
+            d = self.sock.recv(262144)
+            if not d:
+                raise EOFError("connection closed")
+            self.buf += d
+        return item
+
     def frames(self):
         """Yield (channel, packet) for interleaved data; skip RTSP replies."""
         while True:
-            self._read(1)
-            if self.buf[0] != 0x24:
-                if self.buf.startswith(b"RTSP/"):
-                    self.read_response()
-                else:
-                    self.buf = self.buf[1:]
-                continue
-            self._read(4)
-            ch, n = self.buf[1], int.from_bytes(self.buf[2:4], "big")
-            self._read(4 + n)
-            pkt, self.buf = self.buf[4:4 + n], self.buf[4 + n:]
-            yield ch, pkt
+            yield self.next_frame()
+
+
+class Control:
+    """UDP link to localservice.py for one playback slot: recording times and
+    heartbeats go out, the wanted state comes back ("nvrls-state <gen> <speed>
+    <step>", step = frames asked for since single-frame mode began, or -1)."""
+
+    def __init__(self, service, slot, gen, speed):
+        host, port = service.rsplit(":", 1)
+        self.addr = (host, int(port))
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.slot, self.gen = slot, gen
+        self.speed, self.step = speed, -1
+        self.last_hello = 0.0
+
+    def _send(self, msg):
+        try:
+            self.sock.sendto(msg.encode(), self.addr)
+        except OSError:
+            pass
+
+    def report(self, t):
+        self._send(f"nvrls-time {self.slot} {self.gen} {t}")
+
+    def poll(self):
+        now = time.monotonic()
+        if now - self.last_hello > 1:
+            self.last_hello = now
+            self._send(f"nvrls-hello {self.slot} {self.gen} -")
+        while True:
+            try:
+                data = self.sock.recv(512)
+            except OSError:  # nothing waiting (or localservice.py not there)
+                return
+            try:
+                tag, gen, speed, step = data.decode("ascii").split()
+                if tag == "nvrls-state" and int(gen) == self.gen:
+                    self.speed, self.step = min(max(float(speed), 1 / 16), 16.0), int(step)
+            except ValueError:
+                pass
 
 
 def parse_sdp(sdp):
@@ -331,7 +407,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (testing)")
     args = ap.parse_args()
 
-    report = None
+    ctl = None
     if args.slot is not None:  # what this playback stream plays: {"track", "start", "end", "gen"}
         if args.output is None:  # "--slot N {output}": the only positional is the output
             args.output, args.channel = args.channel, None
@@ -341,15 +417,7 @@ def main():
         except Exception as e:  # noqa: BLE001
             sys.exit(f"slot {args.slot}: nothing to play ({e})")
         args.channel, args.start, args.end = str(int(job["track"])), job["start"], job.get("end")
-        rhost, rport = args.service.rsplit(":", 1)
-        rsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        tag = f"nvrls-time {args.slot} {int(job['gen'])} "
-
-        def report(t):
-            try:
-                rsock.sendto((tag + t).encode(), (rhost, int(rport)))
-            except OSError:
-                pass
+        ctl = Control(args.service, args.slot, int(job["gen"]), float(job.get("speed") or 1))
     if not args.channel:
         ap.error("channel or --slot is required")
 
@@ -406,7 +474,9 @@ def main():
                          f"Transport: RTP/AVP/TCP;unicast;interleaved={2 * i}-{2 * i + 1};mode=record\r\n")
         sink.request("RECORD", args.output)
 
-    nvr.request("PLAY", src_url, "Range: npt=0.000-\r\n")
+    play_url = src_url.split("?")[0]  # PAUSE/PLAY (speed) during a recording
+    speed = ctl.speed if ctl else 1.0
+    nvr.request("PLAY", src_url, "Range: npt=0.000-\r\n" + (f"Scale: {speed:g}\r\n" if speed != 1 else ""))
     dec = VideoDecryptor(aes, hevc)
     end = time.monotonic() + args.seconds if args.seconds else None
     last_keepalive = time.monotonic()
@@ -414,31 +484,100 @@ def main():
     started = False
     fu_state = {}
     last_time = None
+    retime = {}            # channel -> [last RTP timestamp in, timestamp out]
+    audio_ok = True        # audio stops for good once the speed changes
+    held = deque()         # single-frame mode: packets read but not yet released
+    held_frames = 0
+    stepping, done, nvr_paused = False, 0, False
+
+    def is_frame_end(ch, pkt):
+        return ch == video_ch and pkt[1] & 0x80 and pkt[1] & 0x7F in payload_types[ch]
+
+    def forward(ch, pkt):
+        nonlocal last_time, started
+        if ctl and ch == video_ch and (t := recording_time(pkt)) and t != last_time:
+            last_time = t
+            ctl.report(t)
+        if len(pkt) < 12 or pkt[1] & 0x7F not in payload_types.get(ch, ()):
+            return  # e.g. the NVR's empty PT 112 packets that only carry the time
+        if ctl:
+            if ch != video_ch:
+                if not audio_ok:
+                    return
+            else:  # timestamps at the browser's pace: scaled by the playback speed
+                ts = int.from_bytes(pkt[4:8], "big")
+                st = retime.setdefault(ch, [ts, float(ts)])
+                d = (ts - st[0]) & 0xFFFFFFFF
+                if d >= 1 << 31 or d > 90000 * 5:  # backwards or a jump: one frame on
+                    d = 3600
+                st[0] = ts
+                st[1] += d / speed
+                pkt = pkt[:4] + (int(st[1]) & 0xFFFFFFFF).to_bytes(4, "big") + pkt[8:]
+        pkts = dec.process(pkt) if ch == video_ch else [pkt]
+        if sink:
+            for p in pkts:
+                sink.sock.sendall(b"$" + bytes([ch]) + len(p).to_bytes(2, "big") + p)
+        elif ch == video_ch:
+            for nal in annexb(pkts, hevc, fu_state):
+                if not started:  # start at the first parameter set
+                    started = ((nal[0] >> 1) & 0x3F) == 32 if hevc else (nal[0] & 0x1F) == 7
+                    if not started:
+                        continue
+                out.write(b"\x00\x00\x00\x01" + nal)
+            out.flush()
+
+    def nvr_play(scale):
+        nvr.send("PLAY", play_url, f"Scale: {scale:g}\r\n")
 
     try:
-        for ch, pkt in nvr.frames():
+        while True:
             if time.monotonic() - last_keepalive > KEEPALIVE:
                 nvr.send("GET_PARAMETER", src_url)
                 last_keepalive = time.monotonic()
+            if ctl:
+                ctl.poll()
+                if ctl.step >= 0 and not stepping:  # single-frame mode: hold the stream
+                    stepping, done, audio_ok, speed = True, 0, False, 1.0
+                    nvr.send("PAUSE", play_url)
+                    nvr_paused = True
+                elif stepping and ctl.step < 0:  # play again, from the frames held back
+                    stepping = False
+                    while held:
+                        forward(*held.popleft())
+                    held_frames = 0
+                    speed = ctl.speed
+                    nvr_play(speed)
+                    nvr_paused = False
+                elif not stepping and ctl.speed != speed:
+                    speed, audio_ok = ctl.speed, False
+                    nvr_play(speed)
+                if stepping:
+                    while done < ctl.step and held_frames:
+                        while held:
+                            ch, pkt = held.popleft()
+                            forward(ch, pkt)
+                            if is_frame_end(ch, pkt):
+                                held_frames -= 1
+                                break
+                        done += 1
+                    if held_frames < 4 and nvr_paused:  # running low: fetch a few more
+                        nvr_play(1)
+                        nvr_paused = False
+                    elif held_frames >= 12 and not nvr_paused:
+                        nvr.send("PAUSE", play_url)
+                        nvr_paused = True
+            item = nvr.next_frame(0.1 if ctl else None)
+            if item is None:
+                continue
+            ch, pkt = item
             if ch % 2:  # RTCP: not forwarded
                 continue
-            if report and ch == video_ch and (t := recording_time(pkt)) and t != last_time:
-                last_time = t
-                report(t)
-            if len(pkt) < 12 or pkt[1] & 0x7F not in payload_types.get(ch, ()):
-                continue  # e.g. the NVR's empty PT 112 packets that only carry the time
-            pkts = dec.process(pkt) if ch == video_ch else [pkt]
-            if sink:
-                for p in pkts:
-                    sink.sock.sendall(b"$" + bytes([ch]) + len(p).to_bytes(2, "big") + p)
-            elif ch == video_ch:
-                for nal in annexb(pkts, hevc, fu_state):
-                    if not started:  # start at the first parameter set
-                        started = ((nal[0] >> 1) & 0x3F) == 32 if hevc else (nal[0] & 0x1F) == 7
-                        if not started:
-                            continue
-                    out.write(b"\x00\x00\x00\x01" + nal)
-                out.flush()
+            if stepping:
+                held.append((ch, pkt))
+                if is_frame_end(ch, pkt):
+                    held_frames += 1
+            else:
+                forward(ch, pkt)
             if end and time.monotonic() > end:
                 break
     except (BrokenPipeError, ConnectionResetError, KeyboardInterrupt, EOFError):

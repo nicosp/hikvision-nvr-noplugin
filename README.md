@@ -9,7 +9,8 @@ You open the NVR's usual web UI through a small nginx site on a Linux box. The
 UI believes its plugin is installed and drives it as usual: its own channel
 list, window splits (1/4/9/16), start/stop, snapshot, recording and full
 screen all work on the Live View page, and recordings play on the Playback
-page (play, pause, stop, jump to a time, with the timeline following along).
+page (play, pause, stop, jump to a time, slow/fast forward from 1/4x to 4x
+and single frame, with the timeline following along).
 
 Tested with a DS-7604NI-K1(B) (web UI V4.0.1 build 201029), with Hikvision
 "Video Encryption" turned on.
@@ -122,9 +123,9 @@ site. The defaults are sub stream and "start all live view" on.
 
 ## Limitations
 
-- **Playback** runs at normal speed only: fast/slow forward, single frame and
-  reverse playback are reported as failed to the UI. At most 16 recordings can
-  play at once, across all viewers.
+- **Playback**: reverse playback is reported as failed to the UI. At most 16
+  recordings can play at once, across all viewers. Recordings play without
+  sound once the speed has been changed.
 - **Two-way audio** and features that need the viewer's own disk (firmware
   upgrade, file upload/download, export) are reported as failed to the UI.
 - **Drawing tools** on configuration pages (motion grid, regions) can't be
@@ -186,6 +187,17 @@ header extension, and hikdecrypt.py reports it to localservice.py (UDP,
 localhost), which answers the UI's `getOSDTime` with it. Pause stops the
 stream and keeps the last frame on screen; resume and jumping to a time start
 a new stream from that time.
+
+The replies to those UDP reports carry what the stream should do, and
+hikdecrypt.py applies it to the NVR session:
+
+- **Speed** (1/4x to 4x): `PLAY` with `Scale`. The NVR then sends frames
+  faster or slower with their original timestamps; hikdecrypt.py rescales the
+  timestamps, so the browser keeps playing at a normal pace with no extra
+  delay.
+- **Single frame**: the NVR is paused (`PAUSE`), hikdecrypt.py keeps a few
+  frames in hand and releases one per step, and the page pauses the video and
+  moves it on one frame. Play goes on from there.
 
 Recordings may carry G.722.1 audio, which browsers can't play. It is left out.
 

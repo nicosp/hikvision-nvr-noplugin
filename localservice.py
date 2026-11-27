@@ -19,7 +19,8 @@ while someone watches it.
 Recordings play through go2rtc's playback streams pb1..pbN: a playback window
 gets a free slot, and the hikdecrypt.py that go2rtc starts for that stream asks
 this service what to play (GET /slot/N, localhost only) and reports the
-recording time back (UDP, same port), which answers the UI's getOSDTime. Pause
+recording time back (UDP, same port), which answers the UI's getOSDTime. The
+replies to those datagrams carry the wanted speed and single-frame steps. Pause
 and resume restart the stream from where it was.
 
 Commands that need the viewer's local disk (upgrade, upload, file download,
@@ -55,6 +56,8 @@ PAGE_ID = re.compile(r"^[A-Za-z0-9]{1,32}$")
 FAIL = 1  # generic error code for commands that can't be done here
 PB_SLOTS = 16  # go2rtc playback streams pb1..pb16 (setup.py), shared by all viewers
 PB_LAG = 1.0   # seconds the viewer is behind the time hikdecrypt.py reports
+PB_FRAME = 0.04  # seconds per single-frame step, for the timeline (25 fps)
+SPEEDS = (0.125, 8.0)  # slowest and fastest playback (the UI goes from 1/4 to 4)
 TZ_NAME = re.compile(r"^[A-Za-z0-9_+\-/]{1,64}$")
 
 log = logging.getLogger("localservice")
@@ -87,7 +90,6 @@ UNSUPPORTED = {
     "video.uploadFile", "video.downloadFile", "video.startAsyncDownload",
     "video.startUpgrade", "video.exportDeviceLog", "video.exportReport",
     "video.startTalk", "video.reversePlay",
-    "video.fast", "video.slow", "video.frame",  # playback runs at normal speed only
 }
 
 
@@ -244,7 +246,8 @@ def parse_play_url(url):
 class Service:
     def __init__(self, state_dir):
         self.pages = {}
-        self.slots = {}         # playback slot -> {"track", "start", "end", "gen", "time", "mono", "page", "wnd"}
+        self.slots = {}         # playback slot -> dict, see take_slot
+        self.udp = None         # datagram transport: time reports in, state out
         self.free = deque(range(1, PB_SLOTS + 1))
         self.gen = 0
         self.cfg_file = Path(state_dir) / "localconfig.json" if state_dir else None
@@ -276,14 +279,18 @@ class Service:
 
     # --- playback slots -------------------------------------------------------------
 
-    def take_slot(self, page, wnd, track, start, end):
+    def take_slot(self, page, wnd, track, start, end, speed=1.0):
         if not self.free:
             log.warning("page %s: all %d playback streams are in use", page.pid, PB_SLOTS)
             raise Failed(FAIL)
         n = self.free.popleft()
         self.gen += 1
-        self.slots[n] = {"track": track, "start": start, "end": end, "gen": self.gen,
-                         "time": None, "mono": None, "page": page, "wnd": wnd}
+        self.slots[n] = {
+            "track": track, "start": start, "end": end, "gen": self.gen, "page": page, "wnd": wnd,
+            "seen": None, "mono": 0.0,  # viewer at "seen" (NVR clock) at monotonic "mono", then + speed
+            "speed": speed, "step": -1, "frozen": None,  # single-frame: steps since "frozen"
+            "addr": None,               # hikdecrypt.py's UDP address
+        }
         return n
 
     def drop_slot(self, n):
@@ -302,10 +309,19 @@ class Service:
     @staticmethod
     def wall_time(slot):
         """What the viewer sees now (NVR clock, naive datetime)."""
-        if slot["time"]:
-            seen = datetime.strptime(slot["time"], "%Y%m%dT%H%M%S")
-            return seen + timedelta(seconds=time.monotonic() - slot["mono"] - PB_LAG)
+        if slot["step"] >= 0:
+            return slot["frozen"] + timedelta(seconds=slot["step"] * PB_FRAME)
+        if slot["seen"]:
+            return slot["seen"] + timedelta(seconds=(time.monotonic() - slot["mono"]) * slot["speed"])
         return datetime.strptime(slot["start"], "%Y%m%dT%H%M%SZ")
+
+    def rebase(self, slot):
+        """Before changing speed or stepping: the timeline goes on from now."""
+        slot["seen"], slot["mono"] = self.wall_time(slot), time.monotonic()
+
+    def send_state(self, slot):
+        if self.udp and slot["addr"]:
+            self.udp.sendto(f"nvrls-state {slot['gen']} {slot['speed']:g} {slot['step']}".encode(), slot["addr"])
 
     @staticmethod
     def epoch(page, wall):
@@ -322,20 +338,28 @@ class Service:
         if slot is None:
             return None
         # If go2rtc restarts the stream (viewer reconnected), go on from where it was.
-        start = f"{slot['time']}Z" if slot["time"] else slot["start"]
+        start = self.wall_time(slot).strftime("%Y%m%dT%H%M%SZ") if slot["seen"] else slot["start"]
         if slot["end"] and start >= slot["end"]:
             return None
-        return {"track": slot["track"], "start": start, "end": slot["end"], "gen": slot["gen"]}
+        return {"track": slot["track"], "start": start, "end": slot["end"], "gen": slot["gen"],
+                "speed": slot["speed"]}
 
-    def time_report(self, data):
-        """UDP from hikdecrypt.py: "nvrls-time <slot> <gen> <YYYYMMDDTHHMMSS>"."""
+    def datagram(self, data, addr):
+        """UDP from hikdecrypt.py: "nvrls-time <slot> <gen> <YYYYMMDDTHHMMSS>" or
+        "nvrls-hello <slot> <gen> -". Answered with the slot's wanted state."""
         try:
             tag, n, gen, t = data.decode("ascii").split()
             slot = self.slots.get(int(n))
         except (UnicodeDecodeError, ValueError):
             return
-        if tag == "nvrls-time" and slot and slot["gen"] == int(gen) and re.fullmatch(r"\d{8}T\d{6}", t):
-            slot["time"], slot["mono"] = t, time.monotonic()
+        if tag not in ("nvrls-time", "nvrls-hello") or not slot or slot["gen"] != int(gen):
+            return
+        slot["addr"] = addr
+        if tag == "nvrls-time" and re.fullmatch(r"\d{8}T\d{6}", t) and slot["step"] < 0:
+            # The viewer sees this about PB_LAG seconds from now.
+            slot["seen"] = datetime.strptime(t, "%Y%m%dT%H%M%S")
+            slot["mono"] = time.monotonic() + PB_LAG
+        self.send_state(slot)
 
     def release(self, page):
         if not page.plugins and not page.bridges:
@@ -462,17 +486,50 @@ class Service:
             slot = self.slots[w["pb"]]
             at = self.wall_time(slot).strftime("%Y%m%dT%H%M%SZ")
             self.drop_slot(w.pop("pb"))
-            w.update(paused=True, at=at, track=slot["track"], end=slot["end"])
+            w.pop("step", None)
+            w.update(paused=True, at=at, track=slot["track"], end=slot["end"], speed=slot["speed"])
             log.info("page %s: window %d paused at %s", page.pid, wnd, at)
             await page.push()
         elif cmd == "video.resume":
             w = page.wnds.get(wnd) or {}
+            slot = self.slots.get(w.get("pb"))
+            if slot and slot["step"] >= 0:  # out of single-frame mode, at normal speed
+                self.rebase(slot)            # (the UI sets its speed again right after)
+                slot["step"], slot["speed"] = -1, 1.0
+                w.pop("step", None)
+                self.send_state(slot)
+                log.info("page %s: window %d plays on", page.pid, wnd)
+                await page.push()
+                return None
             if not w.get("paused"):
                 raise Failed(FAIL)
-            w["pb"] = self.take_slot(page, wnd, w["track"], w["at"], w["end"])
-            for k in ("paused", "at", "track", "end"):
+            w["pb"] = self.take_slot(page, wnd, w["track"], w["at"], w["end"], w.get("speed", 1.0))
+            for k in ("paused", "at", "track", "end", "speed"):
                 w.pop(k, None)
             log.info("page %s: window %d resumed (stream pb%d)", page.pid, wnd, w["pb"])
+            await page.push()
+        elif cmd in ("video.fast", "video.slow"):
+            slot = self.slots.get((page.wnds.get(wnd) or {}).get("pb"))
+            if not slot or slot["step"] >= 0:
+                raise Failed(FAIL)
+            new = slot["speed"] * (2 if cmd == "video.fast" else 0.5)
+            if not SPEEDS[0] <= new <= SPEEDS[1]:
+                raise Failed(FAIL)
+            self.rebase(slot)
+            slot["speed"] = new
+            self.send_state(slot)
+            log.info("page %s: window %d at %gx", page.pid, wnd, new)
+        elif cmd == "video.frame":
+            w = page.wnds.get(wnd) or {}
+            slot = self.slots.get(w.get("pb"))
+            if not slot:
+                raise Failed(FAIL)
+            if slot["step"] < 0:
+                slot["frozen"], slot["step"] = self.wall_time(slot), 1
+            else:
+                slot["step"] += 1
+            w["step"] = slot["step"]
+            self.send_state(slot)
             await page.push()
         elif cmd == "video.getPlayInfo":
             return {"playInfo": {"playInfo": {}}}
@@ -625,8 +682,11 @@ async def main():
     server = await asyncio.start_server(svc.handle, host, int(port), limit=16384)
 
     class TimeReports(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            svc.udp = transport
+
         def datagram_received(self, data, addr):
-            svc.time_report(data)
+            svc.datagram(data, addr)
 
     await asyncio.get_running_loop().create_datagram_endpoint(TimeReports, local_addr=(host, int(port)))
     log.info("listening on %s (version %s)", args.listen, VERSION)

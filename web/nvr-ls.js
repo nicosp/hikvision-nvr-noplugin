@@ -7,7 +7,9 @@
 // plays. A window only has a player while it plays and is visible, and players
 // stop while the browser tab is hidden, so go2rtc only pulls the cameras that
 // are actually on screen. Recordings play through go2rtc's pbN streams; a paused
-// one keeps its last frame on screen while its stream is stopped.
+// one keeps its last frame on screen while its stream is stopped. In single-frame
+// mode the video is paused and moved on one frame per step (hikdecrypt.py
+// releases one more frame from the NVR for each).
 (() => {
   if (/\/login\.asp$/i.test(location.pathname)) return;
 
@@ -182,11 +184,47 @@
         v.media = "video,audio";
         v.src = `/go2rtc/api/ws?src=${encodeURIComponent(want)}`;
         cell.append(v, el("span", "nvrls-label", label));
-        players.set(i, { name: want, el: v });
+        const p = { name: want, el: v, frameDur: 0.04, step: -1 };
+        players.set(i, p);
+        watchFrames(p);
       }
     }
     applySound();
+    applySteps();
     paintSelection();
+  }
+
+  // Frame spacing of what plays, for single-frame steps.
+  function watchFrames(p) {
+    const v = p.el.video;
+    if (!v?.requestVideoFrameCallback) return;
+    let last = null;
+    const cb = (now, meta) => {
+      if (last !== null && !v.paused) {
+        const d = meta.mediaTime - last;
+        if (d > 0.005 && d < 0.5) p.frameDur = d;
+      }
+      last = meta.mediaTime;
+      if (players.get(Number(p.el.closest(".nvrls-wnd")?.dataset.wnd)) === p) v.requestVideoFrameCallback(cb);
+    };
+    v.requestVideoFrameCallback(cb);
+  }
+
+  function applySteps() {
+    for (const [i, p] of players) {
+      const v = p.el?.video;
+      const step = state.wnds[i]?.step ?? -1;
+      if (!v || step === p.step) continue;
+      if (step < 0) {
+        v.play().catch(() => {});
+      } else {
+        v.pause();
+        const n = Math.max(1, step - Math.max(p.step, 0));
+        const end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : v.currentTime;
+        v.currentTime = Math.min(end, v.currentTime + n * p.frameDur);
+      }
+      p.step = step;
+    }
   }
 
   function stopPlayer(i) {
