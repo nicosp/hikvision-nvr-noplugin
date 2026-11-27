@@ -13,6 +13,12 @@
 (() => {
   if (/\/login\.asp$/i.test(location.pathname)) return;
 
+  // Hide "Download Plug-in" (nginx also rewrites the header template, but the
+  // browser may hold an older copy of it).
+  const hide = document.createElement("style");
+  hide.textContent = ".header-r .downloadLocal{display:none!important}";
+  document.head.append(hide);
+
   const top = window.top;
   const PAGE = top.__nvrlvPage || (top.__nvrlvPage = Math.random().toString(36).slice(2, 14));
   const HEVC = !!(window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L153.B0"'));
