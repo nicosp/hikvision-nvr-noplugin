@@ -8,7 +8,9 @@ nothing installed on the viewing machine.
 You open the NVR's usual web UI through a small nginx site on a Linux box. The
 UI believes its plugin is installed and drives it as usual: its own channel
 list, window splits (1/4/9/16), start/stop, snapshot, recording and full
-screen all work on the Live View page.
+screen all work on the Live View page, and recordings play on the Playback
+page (play, pause, stop, jump to a time, slow/fast forward from 1/4x to 4x
+and single frame, with the timeline following along).
 
 Tested with a DS-7604NI-K1(B) (web UI V4.0.1 build 201029), with Hikvision
 "Video Encryption" turned on.
@@ -24,6 +26,8 @@ browser ──https──▶ nginx ──▶ NVR web UI (unchanged, apart from a
 - **go2rtc** ([AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc), in a Podman
   container) serves the NVR's RTSP streams to the browser (MSE over a
   WebSocket). It only pulls a camera from the NVR while someone watches it.
+  Recordings play through 16 playback streams (`pb1`…`pb16`) that
+  localservice.py hands out (see [Playback](#playback)).
 - **hikdecrypt.py** undoes Hikvision's stream encryption, if it is on (see
   [Stream encryption](#stream-encryption)).
 - **localservice.py** answers the Local Service protocol that the UI's player
@@ -32,7 +36,8 @@ browser ──https──▶ nginx ──▶ NVR web UI (unchanged, apart from a
   windows inside the page and plays the matching go2rtc stream in each.
 - **nginx** proxies the NVR and points the UI's player script at
   localservice.py instead of `127.0.0.1`. It also hides the "Download Plug-in"
-  link.
+  link (the page script hides it too, in case the browser has an old copy of
+  the page header).
 
 ## Requirements
 
@@ -119,8 +124,9 @@ site. The defaults are sub stream and "start all live view" on.
 
 ## Limitations
 
-- **Playback of recordings** doesn't work yet. The Playback page loads, but
-  the UI reports playback as failed.
+- **Playback**: reverse playback is reported as failed to the UI. At most 16
+  recordings can play at once, across all viewers. Recordings play without
+  sound once the speed has been changed.
 - **Two-way audio** and features that need the viewer's own disk (firmware
   upgrade, file upload/download, export) are reported as failed to the UI.
 - **Drawing tools** on configuration pages (motion grid, regions) can't be
@@ -131,8 +137,11 @@ site. The defaults are sub stream and "start all live view" on.
 - **H.265**: most Hikvision cameras send H.265. Recent Chrome and Firefox play
   it with hardware decoding. If yours can't, set `NVR_TRANSCODE=1` or switch
   the camera to H.264.
-- Live video is about 1 second behind. That is go2rtc's MSE player keeping a
-  small buffer for smooth playback.
+- Video plays at exactly 1x with a small buffer (typically 0.1–0.3 s behind).
+  go2rtc's player would otherwise keep shifting the playback rate around 1x
+  (0.88x, 1.01x, ...) to hold about a second of buffer; the page script turns
+  that off and jumps ahead instead if more than 2 s pile up. Browser add-ons
+  that change the playback speed have no effect on these videos.
 
 ## Troubleshooting
 
@@ -141,7 +150,11 @@ site. The defaults are sub stream and "start all live view" on.
 - No video in Live View: check that the streams play at
   <http://127.0.0.1:1984> on the server. If they don't, check `NVR_HOST`, the
   login, and `NVR_KEY` if encryption is on.
-- After updating, reload the NVR page with Ctrl+Shift+R.
+- After updating, reload the NVR page with Ctrl+Shift+R. If the page still
+  behaves as before (for example "Download Plug-in" still shows), clear the
+  browser's cache for the site.
+- Playback at 4x stutters: the browser decodes four times the normal frame
+  rate then. Use the sub stream, or a lower speed.
 - Each stream can also be opened directly, for example in VLC:
   `rtsp://NVR:554/Streaming/Channels/101` (camera 1 main), `…102` (sub).
   With encryption on, VLC shows garbled video.
@@ -166,6 +179,36 @@ The scheme, worked out by analysing the streams:
 
 To test it without go2rtc, run `hikdecrypt.py 102 --seconds 5 > x.h265`, with
 `NVR_HOST`, `NVR_USER_URL` and `NVR_PASS_URL` (URL-encoded) in the environment.
+
+## Playback
+
+When the Playback page plays a recording, localservice.py gives the window a
+free playback stream (`pbN`). The page script plays that go2rtc stream, and
+go2rtc starts `hikdecrypt.py --slot N`, which asks localservice.py
+(`GET /slot/N`, on localhost only) which recording to play and pulls it from
+the NVR (`/Streaming/tracks/<channel>01?starttime=…`). The NVR login stays
+in go2rtc.
+
+The NVR skips gaps between recordings, so the timeline can't simply count
+seconds from the start. Hikvision puts the recording time in a private RTP
+header extension, and hikdecrypt.py reports it to localservice.py (UDP,
+localhost), which answers the UI's `getOSDTime` with it. Pause stops the
+stream and keeps the last frame on screen; resume and jumping to a time start
+a new stream from that time.
+
+The replies to those UDP reports carry what the stream should do, and
+hikdecrypt.py applies it to the NVR session:
+
+- **Speed** (1/4x to 4x): `PLAY` with `Scale`. The NVR then sends every frame,
+  faster or slower, and hikdecrypt.py scales the timestamps to match, so the
+  video really plays faster or slower. At 4x the browser decodes four times
+  the normal frame rate (each frame depends on the one before, so none can be
+  skipped); hardware decoding handles that easily.
+- **Single frame**: the NVR is paused (`PAUSE`), hikdecrypt.py keeps a few
+  frames in hand and releases one per step, and the page pauses the video and
+  moves it on one frame. Play goes on from there.
+
+Recordings may carry G.722.1 audio, which browsers can't play. It is left out.
 
 ## The Local Service emulation
 
